@@ -1,824 +1,202 @@
-# Звіт з виявлення та аналізу вразливостей у REST API OWASP Juice Shop
+# OWASP API security assessment: Juice Shop
 
-**Виконав:** Тоболовська Євгенія    
-**Курс:** Secure Software Development and Integration
+> 🇳🇴 **Kort på norsk:** Sikkerhetsvurdering av REST-API-et i OWASP Juice Shop, en bevisst sårbar nettbutikk. Fem sårbarheter funnet med Postman, klassifisert etter OWASP API Security Top 10 (2023), STRIDE og CWE, med tiltak sortert etter prioritet.
 
----
+## Executive summary
 
-## 📋 Зміст
+I tested the REST API of [OWASP Juice Shop](https://owasp.org/www-project-juice-shop/), a deliberately vulnerable web shop, in a local Docker container. The goal was to find, classify and explain typical API vulnerabilities the way a security review for a real team would.
 
-1. [Вступ](#вступ)
-2. [Таблиця виявлених вразливостей](#таблиця-виявлених-вразливостей)
-3. [Детальний аналіз вразливостей](#детальний-аналіз-вразливостей)
-4. [Відповідність STRIDE та CWE](#відповідність-stride-та-cwe)
-5. [Рекомендації щодо захисту](#рекомендації-щодо-захисту)
-6. [Висновки](#висновки)
+**Result: 5 vulnerabilities, 1 critical, 3 high and 1 medium.**
 
+| # | Finding | Severity | What an attacker gets |
+|---|---|---|---|
+| 1 | SQL injection in product search | **Critical** | Read, and possibly change, the whole database without logging in |
+| 2 | Any user can read any basket (IDOR) | **High** | Other customers' baskets, by changing a number in the URL |
+| 3 | Any user can list all users | **High** | All accounts, including the admin email, for phishing or brute force |
+| 4 | Registration accepts extra fields (mass assignment) | **High** | Possibly an admin account at sign-up; see the retest note |
+| 5 | Password hash inside the login token | **Medium** | The user's MD5 password hash from any leaked token |
 
----
+**The common root cause** is missing checks on the server: no ownership check, no role check, no allow-list of input fields, no parameterised SQL. All five are cheap to fix during development and expensive to find later.
 
-## Вступ
+**Top three actions:**
+1. Parameterise every database query (fixes 1).
+2. Add ownership and role checks in one shared middleware (fixes 2 and 3).
+3. Accept only known fields on input and send only `sub`, `role`, `exp`, `iat` in the token (fixes 4 and 5).
 
-У рамках лабораторної роботи було проведено аналіз безпеки REST API застосунку OWASP Juice Shop з метою виявлення типових вразливостей, що зустрічаються в сучасних вебзастосунках. 
+**Skills shown:** API security testing · OWASP API Security Top 10 (2023) · STRIDE threat modelling · CWE classification · JWT analysis · Postman · Docker · writing findings for both developers and management
 
-**Використані інструменти:**
-- **Docker** для розгортання OWASP Juice Shop (`bkimminich/juice-shop`)
-- **Postman** для тестування API endpoints
-- **jwt.io** для аналізу JWT токенів
+## Scope and method
 
-**Методологія:**
-Тестування проводилося відповідно до методології OWASP API Security Top 10 (2023) з використанням threat modeling підходів STRIDE та класифікації вразливостей за CWE.
+| | |
+|---|---|
+| Target | OWASP Juice Shop (`bkimminich/juice-shop`) in Docker on localhost |
+| Tools | Postman for requests, jwt.io to decode tokens |
+| Accounts | Test accounts in the local instance; no real data |
+| Framework | OWASP API Security Top 10 (2023), STRIDE, CWE |
+| Not in scope | Rate limiting (API4), SSRF (API7), automated scanning |
 
----
+Juice Shop is built to be insecure and runs only on my own machine. Only test systems you own or have written permission to test.
 
-## Таблиця виявлених вразливостей
+## Findings
 
-| № | Ендпоінт | Метод | Токен? | Уразливість | OWASP API | STRIDE | CWE |
-|---|----------|-------|--------|-------------|-----------|--------|-----|
-| 1 | `/rest/user/login` | POST | Ні | Information Disclosure (Password Hash in JWT) | A03 | Information Disclosure | CWE-200 |
-| 2 | `/api/Users` | GET | Так | Broken Function Level Authorization | A05 | Elevation of Privilege | CWE-285 |
-| 3 | `/rest/basket/7` | GET | Так | IDOR (Broken Object Level Authorization) | A01 | Elevation of Privilege | CWE-639 |
-| 4 | `/api/Users` | POST | Ні | Mass Assignment | A06 | Elevation of Privilege | CWE-915 |
-| 5 | `/rest/products/search` | GET | Ні | SQL Injection | A10 | Tampering | CWE-89 |
+| # | Endpoint | Method | Auth | Vulnerability | OWASP API 2023 | STRIDE | CWE |
+|---|---|---|---|---|---|---|---|
+| 1 | `/rest/products/search?q=` | GET | No | SQL injection | (not an API Top 10 category; OWASP Top 10 A03:2021 Injection) | Tampering, Information Disclosure | CWE-89 |
+| 2 | `/rest/basket/{id}` | GET | Yes | IDOR | API1 Broken Object Level Authorization | Elevation of Privilege | CWE-639 |
+| 3 | `/api/Users` | GET | Yes | Missing role check | API5 Broken Function Level Authorization | Elevation of Privilege | CWE-285 |
+| 4 | `/api/Users` | POST | No | Mass assignment | API3 Broken Object Property Level Authorization | Elevation of Privilege | CWE-915 |
+| 5 | `/rest/user/login` | POST | No | Password hash in JWT | API3 Broken Object Property Level Authorization | Information Disclosure | CWE-200 |
 
----
+### 1. SQL injection in product search (critical)
 
-## Детальний аналіз вразливостей
+The search term goes straight into the SQL query.
 
-### 🔴 Вразливість №1: Information Disclosure (Password Hash in JWT)
-
-**Ендпоінт:** `POST /rest/user/login`
-
-#### Суть проблеми
-
-При автентифікації користувача застосунок повертає JWT токен, який містить **повний об'єкт користувача**, включаючи хеш пароля:
-
-```json
-{
-  "id": 23,
-  "email": "student@example.com",
-  "password": "048fe686fd7f8cad6e4d9ac6e400c120",  // ❌ MD5 hash
-  "role": "customer",
-  "totpSecret": "",
-  "profileImage": "/assets/public/images/uploads/default.svg"
-}
-```
-
-#### Чому це небезпечно
-
-1. **Витік хешу пароля:** Будь-хто, хто перехопить JWT (наприклад, через XSS або MITM), отримує доступ до хешу пароля
-2. **Слабкий алгоритм:** MD5 легко зламати через rainbow tables або brute force
-3. **Порушення Principle of Least Privilege:** JWT містить надлишкові дані (profileImage, totpSecret, timestamps), які не потрібні для авторизації
-4. **Репутаційні ризики:** Порушення GDPR (Article 32 - Security of processing)
-
-#### Заходи захисту
-
-**1. Мінімізація JWT payload:**
-```json
-{
-  "sub": "23",
-  "email": "student@example.com",
-  "role": "customer",
-  "exp": 1721163000,
-  "iat": 1721159400
-}
-```
-
-**2. Використання bcrypt замість MD5:**
-```python
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-hashed_password = pwd_context.hash(plain_password)
-```
-
-**3. Secure token storage:**
-- Зберігати JWT в `HttpOnly` cookies замість localStorage
-- Використовувати короткоживучі access tokens (5-15 хв) + refresh tokens
-
----
-
-### 🔴 Вразливість №2: Broken Function Level Authorization
-
-**Ендпоінт:** `GET /api/Users`
-
-#### Суть проблеми
-
-Endpoint `/api/Users` повертає список **всіх користувачів** системи, включаючи адміністратора (`admin@juice-sh.op`), навіть коли запит виконується від імені звичайного користувача з роллю `customer`.
-
-**Запит:**
 ```http
-GET /api/Users HTTP/1.1
-Authorization: Bearer <токен_звичайного_користувача>
+GET /rest/products/search?q=')) -- HTTP/1.1
 ```
 
-**Відповідь:**
-```json
-{
-  "data": [
-    {
-      "id": 1,
-      "email": "admin@juice-sh.op",
-      "role": "admin"
-    },
-    {
-      "id": 2,
-      "email": "jim@juice-sh.op"
-    }
-    // ... всі користувачі
-  ]
-}
+The quote and brackets close the `LIKE` condition and `--` comments out the rest, so the query returns **every product**. With a `UNION SELECT` an attacker can read other tables, such as users and password hashes.
+
+**Impact:** read the database without logging in, and with stacked or modifying queries, change it.
+
+**Fix:** parameterised queries or the ORM for every query. Juice Shop runs on Node.js with Sequelize. An illustration of the pattern and the fix:
+
+```javascript
+// vulnerable: user input inside the SQL string
+sequelize.query(`SELECT * FROM Products WHERE name LIKE '%${q}%'`)
+
+// safe: input passed as a bound parameter
+sequelize.query('SELECT * FROM Products WHERE name LIKE :q', {
+  replacements: { q: `%${q}%` },
+})
 ```
 
-#### Чому це небезпечно
+A WAF rule can catch common payloads, but it is a second layer, not the fix.
 
-1. **Витік інформації про структуру системи:** Зловмисник дізнається email адміністратора
-2. **Підготовка до targeted attacks:** Email `admin@juice-sh.op` можна використати для phishing або brute force
-3. **Порушення конфіденційності:** Звичайні користувачі бачать особисті дані інших користувачів
-4. **Ескалація прав:** Відсутність RBAC дозволяє виконувати admin-функції без admin-ролі
+### 2. Any user can read any basket: IDOR (high)
 
-#### Заходи захисту
+A logged-in customer (user 23) changes the basket id in the URL and gets someone else's basket.
 
-**1. Перевірка ролі через декоратор (з курсу):**
-```python
-from functools import wraps
-from fastapi import HTTPException
-
-def require_role(required_role: str):
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, current_user: User, **kwargs):
-            if current_user.role != required_role:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Requires {required_role} role"
-                )
-            return await func(*args, current_user=current_user, **kwargs)
-        return wrapper
-    return decorator
-
-@app.get("/api/Users")
-@require_role("admin")
-async def get_users(current_user: User = Depends(get_current_user)):
-    return db.all_users()
-```
-
-**2. Використання OPA (Open Policy Agent):**
-```rego
-package api.authz
-
-default allow = false
-
-allow {
-    input.method == "GET"
-    input.path == ["api", "Users"]
-    input.user.role == "admin"
-}
-```
-
-**3. API Gateway rules (Kong/AWS API Gateway):**
-```yaml
-policies:
-  - name: rbac-check
-    config:
-      roles:
-        - admin
-      endpoint: /api/Users
-```
-
----
-
-### 🔴 Вразливість №3: IDOR (Insecure Direct Object Reference)
-
-**Ендпоінт:** `GET /rest/basket/{id}`
-
-#### Суть проблеми
-
-Endpoint дозволяє отримати кошик **будь-якого користувача** шляхом підміни параметра `id` у URL, без перевірки ownership.
-
-**Сценарій атаки:**
-1. Користувач №1 (id=23) отримує свій токен
-2. Користувач №1 змінює URL: `/rest/basket/1` → `/rest/basket/7`
-3. API повертає кошик користувача №7 (UserId=24)
-
-**Запит:**
 ```http
 GET /rest/basket/7 HTTP/1.1
-Authorization: Bearer <токен_користувача_23>
+Authorization: Bearer <token of user 23>
 ```
 
-**Відповідь:**
 ```json
-{
-  "status": "success",
-  "data": {
-    "id": 7,
-    "UserId": 24,  // ❌ Чужий кошик!
-    "Products": [...]
-  }
+{ "status": "success", "data": { "id": 7, "UserId": 24, "Products": [ ... ] } }
+```
+
+**Impact:** basket ids are sequential, so trying 1, 2, 3… reveals every customer's basket. If write endpoints have the same gap, baskets can be changed too.
+
+**Fix:** check ownership on the server for every object.
+
+```javascript
+const basket = await Basket.findByPk(req.params.id)
+if (!basket) return res.status(404).end()
+if (basket.UserId !== req.user.id && req.user.role !== 'admin') {
+  return res.status(403).json({ error: 'Access denied' })
 }
 ```
 
-#### Чому це небезпечно
+Random UUIDs instead of 1, 2, 3 make guessing harder, but they do not replace the ownership check.
 
-1. **Horizontal Privilege Escalation:** Користувач отримує доступ до ресурсів інших користувачів того самого рівня
-2. **Порушення конфіденційності:** Можна побачити товари в кошиках інших людей, їх купівельну поведінку
-3. **Потенційна модифікація:** Якщо є PUT/DELETE endpoints, можна змінити/видалити чужі замовлення
-4. **Масштабування атаки:** Перебір id від 1 до 1000 дає доступ до всіх кошиків
+### 3. Any user can list all users (high)
 
-#### Заходи захисту
+`GET /api/Users` with an ordinary customer token returns every account, including the administrator.
 
-**1. Перевірка ownership (найкращий підхід):**
-```python
-@app.get("/rest/basket/{basket_id}")
-async def get_basket(
-    basket_id: int,
-    current_user: User = Depends(get_current_user)
-):
-    basket = db.get_basket(basket_id)
-    
-    if not basket:
-        raise HTTPException(status_code=404, detail="Basket not found")
-    
-    # ✅ КРИТИЧНА ПЕРЕВІРКА
-    if basket.user_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied: This basket does not belong to you"
-        )
-    
-    return basket
-```
-
-**2. Використання UUID замість sequential ID:**
-```python
-# Замість /rest/basket/7
-# Використовувати /rest/basket/f47ac10b-58cc-4372-a567-0e02b2c3d479
-
-import uuid
-
-class Basket(Base):
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-```
-
-**3. Scoped JWT claims:**
 ```json
-{
-  "sub": "23",
-  "scopes": [
-    "basket:read:own",
-    "basket:write:own"
-  ]
-}
+{ "data": [ { "id": 1, "email": "admin@juice-sh.op", "role": "admin" }, { "id": 2, "email": "jim@juice-sh.op" } ] }
 ```
 
-**Перевірка scope:**
-```python
-if "basket:read:own" not in token.scopes:
-    raise HTTPException(403)
+**Impact:** personal data of all users, and the admin email as a target for phishing and password guessing.
+
+**Fix:** a role check in shared middleware, so a new admin endpoint cannot forget it.
+
+```javascript
+const requireRole = (role) => (req, res, next) =>
+  req.user?.role === role ? next() : res.status(403).json({ error: 'Forbidden' })
+
+app.get('/api/Users', requireRole('admin'), listUsers)
 ```
 
----
+### 4. Registration accepts extra fields: mass assignment (high)
 
-### 🔴 Вразливість №4: Mass Assignment
+The registration endpoint copies the request body onto the user object without an allow-list of fields.
 
-**Ендпоінт:** `POST /api/Users`
-
-#### Суть проблеми
-
-При реєстрації користувача API приймає **будь-які поля** в JSON payload, включаючи `isAdmin`, без валідації whitelist полів.
-
-**Атака:**
 ```http
 POST /api/Users HTTP/1.1
 Content-Type: application/json
 
-{
-  "email": "attacker@example.com",
-  "password": "12345678",
-  "passwordRepeat": "12345678",
-  "securityQuestion": {
-    "id": 1,
-    "answer": "dog"
-  },
-  "isAdmin": true  // ❌ Зловмисник додав вручну
-}
+{ "email": "attacker@example.com", "password": "12345678", "passwordRepeat": "12345678", "isAdmin": true }
 ```
 
-**Очікувана поведінка вразливого коду:**
-```python
-# ❌ НЕБЕЗПЕЧНО
-@app.post("/api/Users")
-def create_user(payload: dict):
-    user = User()
-    for key, value in payload.items():
-        setattr(user, key, value)  # Присвоює ВСІ поля!
-    db.add(user)
-    db.commit()
+**Impact:** fields such as the role can be set by the client at sign-up.
+
+> **Retest note.** The original test sent `isAdmin: true`, and the response was not saved as evidence. Finding 5 shows that Juice Shop stores the role in a field called `role` (`"role": "customer"`). The next test should send `"role": "admin"` and record the response, to confirm the escalation instead of assuming it.
+
+**Fix:** accept only known fields and set sensitive ones on the server.
+
+```javascript
+const { email, password, passwordRepeat, securityQuestion } = req.body
+const user = await User.create({ email, password, securityQuestion, role: 'customer' })
 ```
 
-#### Чому це небезпечно
+### 5. Password hash inside the login token (medium)
 
-1. **Privilege Escalation:** Зловмисник може отримати admin права при реєстрації
-2. **Bypass бізнес-логіки:** Можна встановити `balance=1000000` або `isPremium=true`
-3. **Ін'єкція метаданих:** Можна змінити `createdAt`, `role`, `isVerified`
-4. **GitHub 2012 incident:** Реальний кейс, коли дослідник використав Mass Assignment для доступу до Rails repo
+The JWT returned by `POST /rest/user/login` carries the whole user record, including the password hash.
 
-#### Заходи захисту
-
-**1. Pydantic з whitelist (найкращий підхід):**
-```python
-from pydantic import BaseModel, EmailStr, ConfigDict
-from typing import Optional
-
-class UserCreate(BaseModel):
-    model_config = ConfigDict(extra='forbid')  # ✅ Блокує зайві поля
-    
-    email: EmailStr
-    password: str
-    passwordRepeat: str
-    securityQuestion: dict
-    # isAdmin НЕ включено!
-
-@app.post("/api/Users")
-def create_user(payload: UserCreate):
-    # Pydantic автоматично відкине "isAdmin"
-    user = User(
-        email=payload.email,
-        password=hash_password(payload.password),
-        role="customer"  # ✅ Явно встановлюємо роль
-    )
-    db.add(user)
-    db.commit()
-    return user
-```
-
-**Спроба атаки:**
 ```json
-{
-  "email": "attacker@example.com",
-  "password": "12345678",
-  "isAdmin": true
-}
+{ "id": 23, "email": "student@example.com", "password": "048fe686fd7f8cad6e4d9ac6e400c120", "role": "customer", "totpSecret": "" }
 ```
 
-**Відповідь:**
-```json
-{
-  "detail": [
-    {
-      "loc": ["body", "isAdmin"],
-      "msg": "extra fields not permitted",
-      "type": "value_error.extra"
-    }
-  ]
-}
-```
+A JWT is only signed, not encrypted: anyone who sees the token, for example through XSS or a log file, can read it.
 
-**2. Explicit field mapping (з курсу):**
-```python
-@app.patch("/users/{id}")
-def update_user(id: int, payload: dict):
-    user = db.get_user(id)
-    
-    # ✅ Whitelist дозволених полів
-    allowed_fields = ["name", "email", "phone"]
-    
-    for key, value in payload.items():
-        if key in allowed_fields:
-            setattr(user, key, value)
-    
-    db.commit()
-    return user
-```
+**Impact:** the hash is unsalted MD5, which is fast to crack with rainbow tables or brute force.
+
+**Fix:** keep the token minimal (`sub`, `role`, `exp`, `iat`), keep it short-lived (5–15 minutes), store it in an `HttpOnly` cookie, and hash passwords with bcrypt or Argon2id.
+
+## Why these STRIDE and CWE labels
+
+**Finding 3: Elevation of Privilege, CWE-285 Improper Authorization.** The user is correctly authenticated, so it is not Spoofing or CWE-287. The problem is that a customer can use a function meant for admins: the authorization check is missing. CWE-862 Missing Authorization would also fit, and CWE-284 is too broad.
+
+**Finding 1: Tampering and Information Disclosure, CWE-89.** The input changes the structure of the SQL command (tampering), and the usual result is data leaving the database (disclosure). CWE-89 describes exactly this: an SQL command built from outside input without neutralising special characters.
+
+## Remediation plan
+
+| When | What | Fixes |
+|---|---|---|
+| **Now (1–2 weeks)** | Parameterised queries everywhere; shared ownership and role middleware; minimal JWT payload | 1, 2, 3, 5 |
+| | Allow-list input fields on all create and update endpoints | 4 |
+| **Next (1–3 months)** | Central authorization policy (for example OPA), rate limiting and schema validation in an API gateway, structured logs with a trace id | defence in depth |
+| **Later (3–6 months)** | SAST, dependency and DAST scans as blocking CI gates; alerts on repeated 403s and SQL errors | find the next one earlier |
+
+## Coverage against OWASP API Security Top 10 (2023)
+
+| Risk | Result |
+|---|---|
+| API1 Broken Object Level Authorization | ✅ found: finding 2 |
+| API2 Broken Authentication | ⚠️ related: weak token content, finding 5 |
+| API3 Broken Object Property Level Authorization | ✅ found: findings 4 and 5 |
+| API4 Unrestricted Resource Consumption | not tested |
+| API5 Broken Function Level Authorization | ✅ found: finding 3 |
+| API6 Unrestricted Access to Sensitive Business Flows | not tested |
+| API7 Server Side Request Forgery | not tested |
+| API8 Security Misconfiguration | not tested |
+| API9 Improper Inventory Management | not tested |
+| API10 Unsafe Consumption of APIs | not tested |
+
+## Hva jeg lærte / What I learned
+
+- **Authentication is not authorization.** Three of the five findings happen with a valid token. The server checked who I was, not what I was allowed to do.
+- **Classifying is harder than finding.** Mapping SQL injection correctly took a second look: the 2023 API Top 10 has no injection category, so it belongs to the general OWASP Top 10 instead.
+- **Evidence or it did not happen.** Writing this up again showed that one finding (mass assignment) was assumed, not proven. A finding without a saved response is a hypothesis.
 
 ---
 
-### 🔴 Вразливість №5: SQL Injection
+Originally written as coursework during my MSc in Computer Science (Woolf / GoIT Neoversity, course Secure Software Development and Integration), then translated, corrected and restructured as an assessment report.
 
-**Ендпоінт:** `GET /rest/products/search?q=`
+**Sources:** [OWASP API Security Top 10 2023](https://owasp.org/API-Security/) · [CWE Top 25](https://cwe.mitre.org/top25/) · [OWASP Juice Shop](https://owasp.org/www-project-juice-shop/) · [Microsoft STRIDE](https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats)
 
-#### Суть проблеми
+**Yevheniia Tobolovska** · IT operations and security · [Portfolio](https://tobolovska.no) · [LinkedIn](https://www.linkedin.com/in/yevheniia-tobolovska)
 
-Параметр пошуку `q` напряму підставляється в SQL запит без параметризації або екранування спецсимволів.
-
-**Атака:**
-```http
-GET /rest/products/search?q='))-- HTTP/1.1
-```
-
-**Передбачуваний вразливий SQL:**
-```sql
-SELECT * FROM products 
-WHERE name LIKE '%'))--
-   OR description LIKE '%'))--
-```
-
-**Результат:** Коментар `--` відсікає решту запиту, умова WHERE стає завжди true, повертаються **всі товари**.
-
-**Більш небезпечний payload:**
-```http
-GET /rest/products/search?q=' UNION SELECT id,username,password,email FROM users--
-```
-
-#### Чому це небезпечно
-
-1. **Data Exfiltration:** Можна витягнути всі дані з БД (паролі, токени, особисті дані)
-2. **Модифікація даних:** `'; DROP TABLE users; --` може видалити таблиці
-3. **Bypass автентифікації:** `admin' OR '1'='1` дозволяє увійти без пароля
-4. **Lateral movement:** Доступ до інших таблиць через UNION SELECT
-5. **OWASP Top 10 #3:** SQL Injection досі одна з найнебезпечніших вразливостей
-
-#### Заходи захисту
-
-**1. Параметризовані запити (найкращий підхід):**
-```python
-# ❌ ВРАЗЛИВО
-query = f"SELECT * FROM products WHERE name LIKE '%{user_input}%'"
-cursor.execute(query)
-
-# ✅ БЕЗПЕЧНО
-query = "SELECT * FROM products WHERE name LIKE %s OR description LIKE %s"
-cursor.execute(query, (f'%{user_input}%', f'%{user_input}%'))
-```
-
-**2. ORM (Sequelize, SQLAlchemy, Prisma):**
-```python
-from sqlalchemy import or_
-
-products = db.query(Product).filter(
-    or_(
-        Product.name.like(f'%{search_term}%'),
-        Product.description.like(f'%{search_term}%')
-    )
-).all()
-```
-
-**3. Input validation:**
-```python
-import re
-
-def sanitize_search_query(query: str) -> str:
-    # Whitelist: тільки літери, цифри, пробіли
-    if not re.match(r'^[a-zA-Z0-9\s]+$', query):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid search query. Only alphanumeric characters allowed."
-        )
-    return query
-
-@app.get("/rest/products/search")
-def search_products(q: str):
-    sanitized_q = sanitize_search_query(q)
-    # Використовувати ORM з sanitized_q
-```
-
-**4. WAF rules (ModSecurity):**
-```apache
-SecRule ARGS "@detectSQLi" \
-    "id:1001,\
-    phase:2,\
-    block,\
-    msg:'SQL Injection detected'"
-```
-
----
-
-## Відповідність STRIDE та CWE
-
-### 🎯 Вразливість №2: Broken Function Level Authorization
-
-#### STRIDE: Elevation of Privilege
-
-**Обґрунтування:**
-
-Категорія STRIDE "Elevation of Privilege" означає, що зловмисник може **виконувати дії з більшими правами**, ніж йому дозволено. 
-
-**У нашому випадку:**
-- Звичайний користувач з роллю `customer` може викликати endpoint `/api/Users`
-- Цей endpoint має бути **доступний тільки адміністраторам** (`role: admin`)
-- Але через відсутність перевірки ролі, користувач **отримує привілеї admin** для цієї конкретної функції
-- Результат: horizontal/vertical privilege escalation
-
-**З курсу (документ 7 - STRIDE таблиця):**
-
-| Категорія STRIDE | Приклад для API | Механізми зниження ризиків |
-|------------------|-----------------|---------------------------|
-| **Elevation of Privilege** | Користувач зможе редагувати чужий профіль | Перевірки ownership, RBAC, ACL |
-
-**Чому саме Elevation of Privilege, а не інші категорії:**
-- **НЕ Spoofing:** Користувач автентифікований валідним токеном
-- **НЕ Tampering:** Дані не змінюються, лише читаються
-- **НЕ Information Disclosure:** Хоча дані розкриваються, первинна проблема - в доступі до функції
-- **НЕ Denial of Service:** Система не падає
-- **НЕ Repudiation:** Логування не стосується проблеми
-
-#### CWE-285: Improper Authorization
-
-**Обґрунтування:**
-
-**CWE-285:** "The software does not perform or incorrectly performs an authorization check when an actor attempts to access a resource or perform an action."
-
-**Точна відповідність:**
-- Endpoint `/api/Users` **не виконує перевірку** (does not perform)
-- Перевірка авторизації **має бути**, але її немає
-- Ресурс (список користувачів) доступний без перевірки прав
-
-**Інші CWE, які могли б підходити, але менш точні:**
-- **CWE-862** (Missing Authorization): Теж підходить, але CWE-285 більш загальна категорія
-- **CWE-287** (Improper Authentication): НЕ підходить, бо автентифікація працює
-- **CWE-284** (Improper Access Control): Занадто широка категорія
-
-**З курсу (документ 5 - таблиця зв'язку OWASP і CWE):**
-
-| OWASP API Загроза | CWE з Top 25 | Пояснення зв'язку |
-|-------------------|--------------|-------------------|
-| A05 — Broken Function Level Authorization | CWE-863: Incorrect Authorization | Відсутня перевірка ролі при доступі до POST /admin/reset |
-
-**У нашому випадку:** Аналогічна ситуація - відсутня перевірка ролі для `GET /api/Users`.
-
----
-
-### 🎯 Вразливість №5: SQL Injection
-
-#### STRIDE: Tampering
-
-**Обґрунтування:**
-
-Категорія STRIDE "Tampering" означає **несанкціоновану модифікацію даних** або коду через маніпуляцію вхідними параметрами.
-
-**У нашому випадку:**
-- Зловмисник вставляє SQL код через параметр `q`
-- Цей код **змінює структуру SQL запиту** (tampering з запитом)
-- Результат: запит виконується не так, як задумано розробником
-- Потенційно можна не тільки читати, а й **модифікувати дані** через `UPDATE`, `DELETE`, `INSERT`
-
-**Приклад tampering:**
-```sql
--- Оригінальний запит
-SELECT * FROM products WHERE name LIKE '%apple%'
-
--- Після injection
-SELECT * FROM products WHERE name LIKE '%'; UPDATE products SET price=0; --
-```
-
-**З курсу (документ 7 - STRIDE таблиця):**
-
-| Категорія STRIDE | Приклад для API | Механізми зниження ризиків |
-|------------------|-----------------|---------------------------|
-| **Tampering** | Можливе успішне використання isAdmin=true в тілі запиту | Валідація даних, обмеження полів |
-
-**Чому саме Tampering:**
-- **НЕ Spoofing:** Атака не підміняє ідентичність
-- **НЕ Information Disclosure:** Хоча дані витікають, первинна проблема - в модифікації запиту
-- **НЕ Elevation of Privilege:** Немає ескалації прав користувача
-- **Можливо Tampering ТА Information Disclosure:** SQL Injection часто відноситься до обох категорій
-
-#### CWE-89: SQL Injection
-
-**Обґрунтування:**
-
-**CWE-89:** "The software constructs all or part of an SQL command using externally-influenced input from an upstream component, but it does not neutralize or incorrectly neutralizes special elements that could modify the intended SQL command when it is sent to a downstream component."
-
-**Точна відповідність:**
-- Software (Juice Shop API) **конструює SQL команду**
-- Використовує **external input** (параметр `q` з HTTP запиту)
-- **НЕ нейтралізує** спецсимволи (`'`, `)`, `--`, `;`)
-- Результат: **модифікація SQL команди**
-
-**Класичний приклад з CWE-89:**
-```python
-# Вразливий код
-query = "SELECT * FROM products WHERE name = '" + user_input + "'"
-cursor.execute(query)
-```
-
-**Це точно те, що відбувається в Juice Shop!**
-
-**З курсу (документ 5 - CWE Top 25):**
-
-| № | CWE ID | Назва слабкості | Опис |
-|---|--------|-----------------|------|
-| 3 | **CWE-89** | **SQL Injection** | Неконтрольоване введення значень в SQL-запит, що дозволяє змінювати або читати базу даних |
-
-**З курсу (документ 5 - таблиця зв'язку):**
-
-| OWASP API Загроза | CWE з Top 25 | Пояснення зв'язку та приклад |
-|-------------------|--------------|------------------------------|
-| A10 — Unsafe Consumption of APIs | **CWE-89: SQL Injection** | Переданий параметр в SQL без параметризації призводить до повного доступу до бази |
-
----
-
-## Рекомендації щодо захисту
-
-### 🛡️ Короткострокові заходи (Tactical - 1-2 тижні)
-
-**Пріоритет: CRITICAL**
-
-1. **Виправити SQL Injection:**
-   - Переписати всі raw SQL запити на параметризовані
-   - Використовувати ORM (Sequelize) для всіх DB operations
-   - Додати WAF rules для блокування SQLi patterns
-
-2. **Додати RBAC middleware:**
-```javascript
-function requireRole(role) {
-  return (req, res, next) => {
-    if (req.user.role !== role) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    next();
-  };
-}
-
-app.get('/api/Users', requireRole('admin'), getAllUsers);
-```
-
-3. **Виправити JWT payload:**
-   - Видалити `password`, `totpSecret`, `profileImage` з JWT
-   - Залишити тільки `sub`, `email`, `role`, `exp`, `iat`
-
-4. **Додати ownership checks:**
-```javascript
-app.get('/rest/basket/:id', async (req, res) => {
-  const basket = await Basket.findByPk(req.params.id);
-  
-  if (basket.userId !== req.user.id && req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-  
-  res.json(basket);
-});
-```
-
----
-
-### 🏗️ Середньострокові заходи (Strategic - 1-3 місяці)
-
-**Пріоритет: HIGH**
-
-1. **Впровадити OPA (Open Policy Agent):**
-```rego
-package juice_shop.authz
-
-import future.keywords.if
-
-default allow := false
-
-allow if {
-    input.method == "GET"
-    input.path == ["api", "Users"]
-    input.user.role == "admin"
-}
-
-allow if {
-    input.method == "GET"
-    input.path == ["rest", "basket", basket_id]
-    input.user.id == data.baskets[basket_id].user_id
-}
-```
-
-2. **Migrate на UUID для всіх ресурсів:**
-   - Замінити sequential IDs (1, 2, 3...) на UUIDs
-   - Ускладнити enumeration attacks
-
-3. **API Gateway з rate limiting:**
-```yaml
-# Kong configuration
-plugins:
-  - name: rate-limiting
-    config:
-      minute: 100
-      policy: local
-  
-  - name: request-validator
-    config:
-      body_schema: 'json-schema.json'
-```
-
-4. **Structured logging з trace_id:**
-```javascript
-logger.info({
-  event: 'user.accessed_endpoint',
-  user_id: req.user.id,
-  endpoint: req.path,
-  method: req.method,
-  trace_id: req.headers['x-trace-id'],
-  timestamp: new Date().toISOString()
-});
-```
-
----
-
-### 🔐 Довгострокові заходи (Transformational - 3-6 місяців)
-
-**Пріоритет: MEDIUM**
-
-1. **Zero Trust Architecture:**
-   - Mutual TLS (mTLS) між мікросервісами
-   - Service mesh (Istio/Linkerd) для east-west traffic encryption
-
-2. **CI/CD Security Pipeline:**
-```yaml
-# .github/workflows/security.yml
-jobs:
-  security-checks:
-    steps:
-      - name: SAST (Semgrep)
-        run: semgrep --config=auto --error .
-      
-      - name: Dependency Check
-        run: npm audit --audit-level=high
-      
-      - name: DAST (OWASP ZAP)
-        run: |
-          docker run -t owasp/zap2docker-stable \
-            zap-baseline.py -t http://localhost:3000 \
-            -O openapi.json
-      
-      - name: Policy Check (OPA)
-        run: conftest test deployment.yaml
-```
-
-3. **Security Monitoring (SIEM):**
-   - Інтеграція з Elastic Security / Splunk
-   - Alerts для suspicious patterns:
-     - Multiple IDOR attempts
-     - SQLi patterns in logs
-     - Failed authorization attempts
-
-4. **Regular Penetration Testing:**
-   - Квартальні pentest external vendors
-   - Bug bounty program (HackerOne/Bugcrowd)
-
----
-
-## Висновки
-
-### 📊 Підсумкова статистика
-
-- **Виявлено вразливостей:** 5
-- **Критичних (CRITICAL):** 2 (SQL Injection, IDOR)
-- **Високих (HIGH):** 2 (Broken AuthZ, Mass Assignment)
-- **Середніх (MEDIUM):** 1 (Info Disclosure)
-
-### 🎯 Охоплення OWASP API Top 10
-
-| OWASP API 2023 | Виявлено у Juice Shop |
-|----------------|----------------------|
-| A01: BOLA | ✅ `/rest/basket/{id}` |
-| A02: Broken Authentication | ⚠️ Частково (weak JWT) |
-| A03: Excessive Data Exposure | ✅ Password hash in JWT |
-| A04: Resource Consumption | ❌ Не тестувалось |
-| A05: Broken Function AuthZ | ✅ `/api/Users` |
-| A06: Mass Assignment | ✅ `/api/Users` POST |
-| A07: SSRF | ❌ Не виявлено |
-| A08: Security Misconfiguration | ⚠️ Можливо (debug endpoints?) |
-| A09: Inventory Management | ❌ Не виявлено |
-| A10: Unsafe Consumption | ✅ SQL Injection |
-
-### 💡 Ключові висновки
-
-1. **Juice Shop є відмінним навчальним інструментом**, що демонструє реальні вразливості, які зустрічаються у production системах
-
-2. **Більшість вразливостей можна було запобігти** через:
-   - Використання ORM замість raw SQL
-   - Впровадження RBAC middleware
-   - Валідацію input через Pydantic/Joi
-   - Мінімізацію JWT payload
-
-3. **Security-by-Design підхід критично важливий:**
-   - Легше додати перевірки на етапі розробки, ніж виправляти після инциденту
-   - Вартість виправлення зростає експоненційно (NIST: 30-100x після deploy)
-
-4. **Автоматизація security checks у CI/CD** запобігла б всім виявленим вразливостям:
-   - Semgrep виявив би SQL injection
-   - OPA/Conftest виявили б missing authorization
-   - Bandit виявив би hardcoded secrets (якщо були)
-
-### 🚀 Рекомендації для реальних проєктів
-
-**Для розробників:**
-- Завжди використовуйте ORM
-- Ніколи не включайте sensitive data в JWT
-- Додавайте ownership checks для всіх resource endpoints
-
-**Для DevSecOps:**
-- Впроваджуйте security gates в CI/CD
-- Автоматизуйте SAST/DAST/SCA
-- Моніторьте security metrics (MTTR, vulnerability density)
-
-**Для архітекторів:**
-- Проектуйте API з Zero Trust підходом
-- Використовуйте API Gateway для централізованої авторизації
-- Впроваджуйте observability з trace_id
-
----
-
-## Використані джерела
-
-1. OWASP API Security Top 10 (2023) - https://owasp.org/API-Security/
-2. CWE Top 25 Most Dangerous Software Weaknesses - https://cwe.mitre.org/top25/
-3. OWASP Juice Shop Project - https://owasp.org/www-project-juice-shop/
-4. Microsoft STRIDE Threat Modeling - https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats
-5. Матеріали курсу SSDLC (документи 2-7)
+License: [MIT](LICENSE)
