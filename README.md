@@ -146,7 +146,7 @@ const user = await User.create({ email, password, securityQuestion, role: 'custo
 The JWT returned by `POST /rest/user/login` carries the whole user record, including the password hash.
 
 ```json
-{ "id": 23, "email": "student@example.com", "password": "048fe686fd7f8cad6e4d9ac6e400c120", "role": "customer", "totpSecret": "" }
+{ "id": 23, "email": "student@example.com", "password": "<32-character MD5 hash, redacted>", "role": "customer", "totpSecret": "" }
 ```
 
 A JWT is only signed, not encrypted: anyone who sees the token, for example through XSS or a log file, can read it.
