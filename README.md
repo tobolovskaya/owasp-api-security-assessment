@@ -30,10 +30,10 @@ I tested the REST API of [OWASP Juice Shop](https://owasp.org/www-project-juice-
 | | |
 |---|---|
 | Target | OWASP Juice Shop (`bkimminich/juice-shop`) in Docker on localhost |
-| Tools | Postman for requests, jwt.io to decode tokens |
+| Tools | Postman for requests, jwt.io to decode tokens; Semgrep for a separate SAST cross-check |
 | Accounts | Test accounts in the local instance; no real data |
 | Framework | OWASP API Security Top 10 (2023), STRIDE, CWE |
-| Not in scope | Rate limiting (API4), SSRF (API7), automated scanning |
+| Not in scope | Rate limiting (API4), SSRF (API7), DAST scanning |
 
 Juice Shop is built to be insecure and runs only on my own machine. Only test systems you own or have written permission to test.
 
@@ -185,10 +185,41 @@ A JWT is only signed, not encrypted: anyone who sees the token, for example thro
 | API9 Improper Inventory Management | not tested |
 | API10 Unsafe Consumption of APIs | not tested |
 
+## SAST cross-check: what Semgrep found and missed
+
+To compare manual testing with static analysis, I ran Semgrep 1.144.1 with the `p/owasp-top-ten` ruleset on the Juice Shop source:
+
+```bash
+docker run --rm -v "$(pwd)":/src returntocorp/semgrep semgrep --config p/owasp-top-ten /src --json -o semgrep-owasp-top-ten.json
+```
+
+Semgrep reported **18 findings** (7 ERROR, 11 WARNING). Raw output: [`sast/semgrep-owasp-top-ten.json`](sast/semgrep-owasp-top-ten.json). I triaged each one against the code:
+
+| Verdict | Count | Findings |
+|---|---|---|
+| Confirmed in running code | 9 | SQL injection in `routes/search.ts` (same as finding 1) and `routes/login.ts`; `eval()` on user input in `routes/userProfile.ts`; hardcoded RSA private key used to sign tokens in `lib/insecurity.ts`; open redirect in `routes/redirect.ts` (allow-list checked with `includes()`); file download in `routes/fileServer.ts` (null-byte bypass of the file-type check); directory listing on `/ftp`, `/encryptionkeys` and `/support/logs` |
+| Low, by design | 1 | Directory listing on `/.well-known` |
+| Path traversal blocked | 3 | `res.sendFile` in key, log and quarantine servers: names with `/` are rejected (the exposed folders are already counted above) |
+| Not running code | 4 | SQL injection in `data/static/codefixes/*`: answer options for the coding challenges, not routes |
+| Not confirmed | 1 | `raw-html-format` in `routes/chatbot.ts`: the string is returned inside JSON, not rendered as HTML |
+
+**Compared with the manual assessment:**
+
+| Manual finding | Found by Semgrep? |
+|---|---|
+| 1. SQL injection in product search | Yes |
+| 2. IDOR on baskets | No |
+| 3. Any user can list all users | No |
+| 4. Mass assignment on registration | No |
+| 5. Password hash inside the token | No |
+
+Semgrep found the injection, plus code-level issues outside the API scope of this report (`eval`, the hardcoded key, directory listing). It found none of the four access-control and data-exposure findings: those need knowledge of who is allowed to do what, which is not in the code patterns. DAST with OWASP ZAP was planned but not run, so it is not part of this comparison.
+
 ## Hva jeg lærte / What I learned
 
 - **Authentication is not authorization.** Three of the five findings happen with a valid token. The server checked who I was, not what I was allowed to do.
 - **Classifying is harder than finding.** Mapping SQL injection correctly took a second look: the 2023 API Top 10 has no injection category, so it belongs to the general OWASP Top 10 instead.
+- **SAST and manual testing find different things.** Semgrep found 1 of my 5 findings, but also 8 confirmed issues I had not looked for. Only 9 of its 18 results held up after triage.
 - **Evidence or it did not happen.** Writing this up again showed that one finding (mass assignment) was assumed, not proven. A finding without a saved response is a hypothesis.
 
 ---
