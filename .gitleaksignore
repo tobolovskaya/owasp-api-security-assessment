@@ -1,0 +1,4 @@
+# Old README versions showed the MD5 password hash of a local Juice Shop test account
+# (finding 5). It is not an API key; the hash is now redacted in README.md.
+d04d7d984614ffb94935f06dc71a1fb73c01816f:README.md:generic-api-key:149
+2a092d8047c70d7c9f4da873b38cab94d84df72b:README.md:generic-api-key:60
